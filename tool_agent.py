@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import os
-import pty
+import json
 import re
-import select
 import shlex
 import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -21,6 +22,10 @@ MAX_COMMAND_OUTPUT = 20000
 COMMAND_TIMEOUT_SECONDS = 30
 LLM_START_TIMEOUT_SECONDS = 180
 LLM_RESPONSE_TIMEOUT_SECONDS = 240
+LLM_HOST = os.environ.get("LLM_HOST", "127.0.0.1")
+LLM_PORT = int(os.environ.get("LLM_PORT", "18080"))
+LLM_URL = f"http://{LLM_HOST}:{LLM_PORT}"
+LLM_LOG_PATH = Path(os.environ.get("LLM_LOG_PATH", "/tmp/bitnet-llm-server.log"))
 SYSTEM_PROMPT = """You are BitNet running inside a Dockerized POSIX shell training image.
 Answer normal user requests directly.
 When asked to create shell programs, prefer strictly POSIX sh and terminal-size-aware code.
@@ -138,61 +143,69 @@ def build_system_prompt():
     return f"{SYSTEM_PROMPT}\nCompact POSIX shell knowledge loaded once at startup:\n{skill}"
 
 
-def strip_ansi(text):
-    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
-
-
 class BitNetService:
     def __init__(self):
-        self.master_fd = None
         self.process = None
+        self.log_file = None
 
     def start(self):
         if self.process and self.process.poll() is None:
             return
 
-        print("[llm] starting persistent BitNet service...", flush=True)
-        master_fd, slave_fd = pty.openpty()
+        print("[llm] starting persistent BitNet server...", flush=True)
+        try:
+            LLM_LOG_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        self.log_file = LLM_LOG_PATH.open("ab")
         command = [
-            "python",
-            "run_inference.py",
+            "build/bin/llama-server",
             "-m",
             MODEL_PATH,
+            "-c",
+            "2048",
+            "-t",
+            "2",
             "-n",
             N_PREDICT,
+            "-ngl",
+            "0",
+            "--temp",
+            "0.8",
+            "--host",
+            LLM_HOST,
+            "--port",
+            str(LLM_PORT),
+            "-cb",
             "-p",
             build_system_prompt(),
-            "-cnv",
         ]
         self.process = subprocess.Popen(
             command,
             cwd=BITNET_DIR,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
+            stdin=subprocess.DEVNULL,
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
             close_fds=True,
             start_new_session=True,
         )
-        os.close(slave_fd)
-        self.master_fd = master_fd
-        os.set_blocking(self.master_fd, False)
-        self._read_until_prompt(LLM_START_TIMEOUT_SECONDS)
-        print("[llm] ready", flush=True)
+        self._wait_for_health()
+        self._poke()
+        print("[llm] ready after health check and internal poke", flush=True)
 
     def ask(self, prompt):
         self.start()
-        os.write(self.master_fd, f"{prompt.rstrip()}\n".encode("utf-8"))
-        raw = self._read_until_prompt(LLM_RESPONSE_TIMEOUT_SECONDS)
-        return self._clean_response(raw, prompt)
+        return self._completion(
+            {
+                "prompt": prompt,
+                "n_predict": int(N_PREDICT),
+                "temperature": 0.8,
+                "stream": False,
+            },
+            timeout=LLM_RESPONSE_TIMEOUT_SECONDS,
+        )
 
     def close(self):
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-            self.master_fd = None
-
         if self.process and self.process.poll() is None:
             try:
                 os.killpg(self.process.pid, signal.SIGTERM)
@@ -203,53 +216,71 @@ class BitNetService:
                 except OSError:
                     pass
         self.process = None
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except OSError:
+                pass
+            self.log_file = None
 
-    def _read_until_prompt(self, timeout):
-        deadline = time.monotonic() + timeout
-        chunks = []
+    def _wait_for_health(self):
+        deadline = time.monotonic() + LLM_START_TIMEOUT_SECONDS
+        last_error = ""
 
         while time.monotonic() < deadline:
             if self.process and self.process.poll() is not None:
-                output = "".join(chunks)
-                raise RuntimeError(f"BitNet service exited with code {self.process.returncode}.\n{output}")
-
-            readable, _, _ = select.select([self.master_fd], [], [], 0.2)
-            if not readable:
-                continue
+                raise RuntimeError(self._startup_failure("BitNet server exited during startup"))
 
             try:
-                data = os.read(self.master_fd, 4096)
-            except BlockingIOError:
-                continue
-            except OSError:
-                break
+                with urllib.request.urlopen(f"{LLM_URL}/health", timeout=2) as response:
+                    if response.status == 200:
+                        return
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                last_error = str(exc)
+            time.sleep(1)
 
-            if not data:
-                break
+        raise RuntimeError(self._startup_failure(f"BitNet server health check timed out: {last_error}"))
 
-            chunks.append(data.decode("utf-8", errors="replace"))
-            text = "".join(chunks).replace("\r\n", "\n").replace("\r", "\n")
-            if text.endswith("\n> ") or re.search(r"(?m)^> $", text):
-                return text
-
-        return "".join(chunks)
-
-    def _clean_response(self, raw, prompt):
-        text = strip_ansi(raw).replace("\r\n", "\n").replace("\r", "\n")
-        text = re.sub(r"\n?>\s*$", "", text).strip()
-
-        if prompt in text:
-            text = text.split(prompt, 1)[1].strip()
-
-        noisy_prefixes = (
-            "llama_",
-            "sampler ",
-            "generate:",
-            "system_info:",
-            "main:",
+    def _poke(self):
+        content = self._completion(
+            {
+                "prompt": "Internal startup check. Reply with READY.",
+                "n_predict": 8,
+                "temperature": 0.1,
+                "stream": False,
+            },
+            timeout=60,
         )
-        lines = [line for line in text.splitlines() if not line.strip().startswith(noisy_prefixes)]
-        return "\n".join(lines).strip()
+        if not content.strip():
+            raise RuntimeError(self._startup_failure("BitNet server returned an empty startup poke"))
+
+    def _completion(self, payload, timeout):
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"{LLM_URL}/completion",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            raise RuntimeError(f"BitNet server request failed: {exc}") from exc
+
+        parsed = json.loads(body)
+        return str(parsed.get("content", "")).strip()
+
+    def _startup_failure(self, message):
+        log_tail = ""
+        try:
+            if LLM_LOG_PATH.exists():
+                log_tail = LLM_LOG_PATH.read_text(encoding="utf-8", errors="replace")[-4000:]
+        except OSError:
+            pass
+        if log_tail:
+            return f"{message}.\nLast server log lines:\n{log_tail}"
+        return message
 
 
 def slugify_name(name):
@@ -430,7 +461,7 @@ def handle_tool_request(user_text, llm_service):
 
 def print_help():
     print("BitNet tool agent")
-    print("BitNet runs as a persistent spawned service on the first LLM request.")
+    print("BitNet runs as a health-checked persistent background service.")
     print("Ask normally, or use local tools:")
     print("  /ls [path]       list files")
     print("  /cat <path>      read a text file")
@@ -445,8 +476,9 @@ def print_help():
 def main():
     os.chdir(BITNET_DIR)
     llm_service = BitNetService()
-    print_help()
     try:
+        llm_service.start()
+        print_help()
         while True:
             try:
                 user_text = input("\nYou> ").strip()

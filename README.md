@@ -93,10 +93,14 @@ The default Docker command also starts the tool agent:
 docker run --rm -it yafb/bitnet:latest
 ```
 
-The tool agent opens a `You>` prompt. Use `/exit` or `Ctrl+C` to leave the
-session. BitNet is spawned as an internal persistent service on the first LLM
-request. The wrapper then keeps that process alive and sends later prompts to
-the same session instead of launching a new inference process each time.
+The tool agent starts an internal persistent BitNet server before exposing the
+`You>` prompt. Startup waits for the server `/health` endpoint and then sends a
+small internal poke request. If either check fails, the agent exits instead of
+opening a broken interactive session.
+
+After startup, use `/exit` or `Ctrl+C` to leave the session. The wrapper keeps
+the background BitNet process alive and sends prompts to that service instead of
+launching a new inference process each time.
 
 At service startup, the wrapper loads compact knowledge from `knowledge/skills/`
 once into the initial system prompt. Later game or artifact requests reuse that
