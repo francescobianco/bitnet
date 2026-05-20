@@ -340,6 +340,7 @@ class BitNetService:
                     clean = self._normalize(data)
                     clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", clean)
                     stream_buf += clean
+                    # Flush complete lines first
                     while "\n" in stream_buf:
                         line, stream_buf = stream_buf.split("\n", 1)
                         s = line.strip()
@@ -349,13 +350,15 @@ class BitNetService:
                             continue
                         sys.stdout.write(line + "\n")
                         sys.stdout.flush()
+                    # Stream partial content immediately — don't wait for newline
+                    if stream_buf:
+                        s = stream_buf.strip()
+                        if s and s not in (">", "> ") and not any(s.startswith(p) for p in _noisy):
+                            sys.stdout.write(stream_buf)
+                            sys.stdout.flush()
+                            stream_buf = ""
                 continue
             if idle_deadline and time.monotonic() >= idle_deadline:
-                if stream and stream_buf.strip():
-                    s = stream_buf.strip()
-                    if s not in (">", "> ") and not any(s.startswith(p) for p in _noisy):
-                        sys.stdout.write(s + "\n")
-                        sys.stdout.flush()
                 return "".join(chunks)
         return "".join(chunks)
 

@@ -6,13 +6,14 @@ N_PREDICT ?= 512
 KNOWLEDGE_DIR ?= $(CURDIR)/knowledge
 DOCKER_RUN = $(DOCKER) run --rm -e N_PREDICT=$(N_PREDICT) -e KNOWLEDGE_DIR=/knowledge -v $(KNOWLEDGE_DIR):/knowledge
 
-.PHONY: help build run agent test smoke-test game shell push pull tag-local clean git-push
+.PHONY: help build run agent dev test smoke-test game shell push pull tag-local clean git-push
 
 help:
 	@printf "Available targets:\n"
 	@printf "  make build      Build $(FULL_IMAGE)\n"
 	@printf "  make run        Start native BitNet chat\n"
-	@printf "  make agent      Start BitNet tool agent\n"
+	@printf "  make agent      Rebuild $(FULL_IMAGE) and start the tool agent\n"
+	@printf "  make dev        Start the tool agent mounting tool_agent.py directly (no rebuild)\n"
 	@printf "  make test       Build and smoke-test $(FULL_IMAGE)\n"
 	@printf "  make smoke-test Run a local tool-call smoke test\n"
 	@printf "  make game       Generate and analyze a POSIX sh game\n"
@@ -27,8 +28,11 @@ build:
 run:
 	$(DOCKER_RUN) -it $(FULL_IMAGE) conda run --no-capture-output -n bitnet-cpp python run_inference.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf -n $(N_PREDICT) -p "You are a helpful assistant" -cnv
 
-agent:
+agent: build
 	$(DOCKER_RUN) -it $(FULL_IMAGE)
+
+dev:
+	$(DOCKER_RUN) -it -v $(CURDIR)/tool_agent.py:/app/tool_agent.py $(FULL_IMAGE)
 
 test: build smoke-test
 
