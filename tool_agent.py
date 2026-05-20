@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import os
+import pty
 import re
+import select
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -15,6 +19,14 @@ MAX_LIST_ITEMS = 200
 MAX_FILE_BYTES = 12000
 MAX_COMMAND_OUTPUT = 20000
 COMMAND_TIMEOUT_SECONDS = 30
+LLM_START_TIMEOUT_SECONDS = 180
+LLM_RESPONSE_TIMEOUT_SECONDS = 240
+SYSTEM_PROMPT = """You are BitNet running inside a Dockerized POSIX shell training image.
+Answer normal user requests directly.
+When asked to create shell programs, prefer strictly POSIX sh and terminal-size-aware code.
+The wrapper around you can execute local tools such as ls, cat, find, and shell commands.
+If a user asks for filesystem inspection or command execution, keep your answer brief because the wrapper will run the tool.
+"""
 
 
 def resolve_path(raw_path):
@@ -112,33 +124,132 @@ def run_shell_command(command):
     return f"{header}\n{output}".rstrip()
 
 
-def ask_bitnet(prompt):
-    command = [
-        "python",
-        "run_inference.py",
-        "-m",
-        MODEL_PATH,
-        "-n",
-        N_PREDICT,
-        "-p",
-        prompt,
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=BITNET_DIR,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    return completed.stdout.strip()
-
-
 def read_posix_skill():
     skill_path = KNOWLEDGE_DIR / "skills" / "POSIX.md"
     if not skill_path.exists():
         return ""
     return skill_path.read_text(encoding="utf-8", errors="replace")[:8000]
+
+
+def build_system_prompt():
+    skill = read_posix_skill()
+    if not skill:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT}\nCompact POSIX shell knowledge loaded once at startup:\n{skill}"
+
+
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
+class BitNetService:
+    def __init__(self):
+        self.master_fd = None
+        self.process = None
+
+    def start(self):
+        if self.process and self.process.poll() is None:
+            return
+
+        print("[llm] starting persistent BitNet service...", flush=True)
+        master_fd, slave_fd = pty.openpty()
+        command = [
+            "python",
+            "run_inference.py",
+            "-m",
+            MODEL_PATH,
+            "-n",
+            N_PREDICT,
+            "-p",
+            build_system_prompt(),
+            "-cnv",
+        ]
+        self.process = subprocess.Popen(
+            command,
+            cwd=BITNET_DIR,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave_fd)
+        self.master_fd = master_fd
+        os.set_blocking(self.master_fd, False)
+        self._read_until_prompt(LLM_START_TIMEOUT_SECONDS)
+        print("[llm] ready", flush=True)
+
+    def ask(self, prompt):
+        self.start()
+        os.write(self.master_fd, f"{prompt.rstrip()}\n".encode("utf-8"))
+        raw = self._read_until_prompt(LLM_RESPONSE_TIMEOUT_SECONDS)
+        return self._clean_response(raw, prompt)
+
+    def close(self):
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+
+        if self.process and self.process.poll() is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+                self.process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        self.process = None
+
+    def _read_until_prompt(self, timeout):
+        deadline = time.monotonic() + timeout
+        chunks = []
+
+        while time.monotonic() < deadline:
+            if self.process and self.process.poll() is not None:
+                output = "".join(chunks)
+                raise RuntimeError(f"BitNet service exited with code {self.process.returncode}.\n{output}")
+
+            readable, _, _ = select.select([self.master_fd], [], [], 0.2)
+            if not readable:
+                continue
+
+            try:
+                data = os.read(self.master_fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break
+
+            if not data:
+                break
+
+            chunks.append(data.decode("utf-8", errors="replace"))
+            text = "".join(chunks).replace("\r\n", "\n").replace("\r", "\n")
+            if text.endswith("\n> ") or re.search(r"(?m)^> $", text):
+                return text
+
+        return "".join(chunks)
+
+    def _clean_response(self, raw, prompt):
+        text = strip_ansi(raw).replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\n?>\s*$", "", text).strip()
+
+        if prompt in text:
+            text = text.split(prompt, 1)[1].strip()
+
+        noisy_prefixes = (
+            "llama_",
+            "sampler ",
+            "generate:",
+            "system_info:",
+            "main:",
+        )
+        lines = [line for line in text.splitlines() if not line.strip().startswith(noisy_prefixes)]
+        return "\n".join(lines).strip()
 
 
 def slugify_name(name):
@@ -224,7 +335,7 @@ def analyze_shell_script(script_path, raw_path):
     return "\n".join(report) + "\n"
 
 
-def generate_game(request):
+def generate_game(request, llm_service):
     parts = request.strip().split(maxsplit=1)
     name = slugify_name(parts[0] if parts else "game")
     description = parts[1] if len(parts) > 1 else name
@@ -234,15 +345,11 @@ def generate_game(request):
     generated_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    skill = read_posix_skill()
     prompt = f"""Create one complete terminal game in strictly POSIX sh.
 Only output the shell script in one ```sh code block.
 Game request: {description}
-
-Use this compact POSIX shell knowledge:
-{skill}
 """
-    raw = ask_bitnet(prompt)
+    raw = llm_service.ask(prompt)
     raw_path = generated_dir / f"{name}.raw.txt"
     script_path = generated_dir / f"{name}.sh"
     report_path = reports_dir / f"{name}.md"
@@ -279,15 +386,15 @@ def extract_path_after(text, markers, default="."):
     return default
 
 
-def handle_tool_request(user_text):
+def handle_tool_request(user_text, llm_service):
     lowered = user_text.lower()
 
     if lowered.startswith("/game "):
-        return "game", generate_game(user_text[6:])
+        return "game", generate_game(user_text[6:], llm_service)
 
     for marker in ("crea un gioco ", "create a game ", "generate a game "):
         if lowered.startswith(marker):
-            return "game", generate_game(user_text[len(marker):])
+            return "game", generate_game(user_text[len(marker):], llm_service)
 
     if lowered.startswith("/sh ") or lowered.startswith("!"):
         command = user_text[4:] if lowered.startswith("/sh ") else user_text[1:]
@@ -323,6 +430,7 @@ def handle_tool_request(user_text):
 
 def print_help():
     print("BitNet tool agent")
+    print("BitNet runs as a persistent spawned service on the first LLM request.")
     print("Ask normally, or use local tools:")
     print("  /ls [path]       list files")
     print("  /cat <path>      read a text file")
@@ -336,30 +444,34 @@ def print_help():
 
 def main():
     os.chdir(BITNET_DIR)
+    llm_service = BitNetService()
     print_help()
-    while True:
-        try:
-            user_text = input("\nYou> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
+    try:
+        while True:
+            try:
+                user_text = input("\nYou> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
 
-        if not user_text:
-            continue
-        if user_text.lower() in {"/exit", "exit", "quit", "/quit"}:
-            return 0
-        if user_text.lower() in {"/help", "help"}:
-            print_help()
-            continue
+            if not user_text:
+                continue
+            if user_text.lower() in {"/exit", "exit", "quit", "/quit"}:
+                return 0
+            if user_text.lower() in {"/help", "help"}:
+                print_help()
+                continue
 
-        tool_name, tool_result = handle_tool_request(user_text)
-        if tool_name:
-            print(f"\n[tool:{tool_name}]")
-            print(tool_result)
-            continue
+            tool_name, tool_result = handle_tool_request(user_text, llm_service)
+            if tool_name:
+                print(f"\n[tool:{tool_name}]")
+                print(tool_result)
+                continue
 
-        print("\nBitNet>")
-        print(ask_bitnet(user_text))
+            print("\nBitNet>")
+            print(llm_service.ask(user_text))
+    finally:
+        llm_service.close()
 
 
 if __name__ == "__main__":
