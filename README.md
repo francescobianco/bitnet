@@ -4,7 +4,7 @@ This project provides a Dockerized build of Microsoft's BitNet runtime using the
 `microsoft/BitNet-b1.58-2B-4T-gguf` model from Hugging Face.
 
 The image builds BitNet from source, compiles the CPU runtime, downloads the GGUF
-model, prepares the `i2_s` quantized model, and exposes a default inference
+model, prepares the `i2_s` quantized model, and exposes an interactive chat
 command that can be run directly with Docker.
 
 ## Image
@@ -50,7 +50,7 @@ docker build -t yafb/bitnet:latest .
 
 ## Run
 
-Run the default inference command:
+Start an interactive BitNet chat session:
 
 ```sh
 make run
@@ -59,11 +59,11 @@ make run
 Equivalent Docker command:
 
 ```sh
-docker run --rm yafb/bitnet:latest
+docker run --rm -it yafb/bitnet:latest
 ```
 
-The default command runs a short non-interactive prompt so the container starts,
-loads the model, generates text, and exits.
+The default command loads the model and opens BitNet conversation mode. Use
+`Ctrl+C` to leave the session.
 
 ## Test
 
@@ -73,8 +73,8 @@ Build and run the image:
 make test
 ```
 
-This target verifies that the Dockerfile builds successfully and that the
-container can load the model and run inference.
+This target verifies that the Dockerfile builds successfully and starts the
+interactive BitNet session.
 
 ## Interactive Shell
 
@@ -86,18 +86,12 @@ make shell
 
 From inside the container, BitNet is available in `/app/BitNet`.
 
-## Interactive Chat
+## Direct Docker Chat
 
-The default container command is intentionally non-interactive. To start BitNet
-in conversation mode, override the Docker command:
+The default container command is the interactive BitNet chat command:
 
 ```sh
-docker run --rm -it yafb/bitnet:latest \
-  conda run --no-capture-output -n bitnet-cpp \
-  python run_inference.py \
-  -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
-  -p "You are a helpful assistant" \
-  -cnv
+docker run --rm -it yafb/bitnet:latest
 ```
 
 ## Push
@@ -125,8 +119,8 @@ docker login
 ```sh
 make help       # Show available commands
 make build      # Build yafb/bitnet:latest
-make run        # Run the default inference command
-make test       # Build and run the image
+make run        # Start an interactive BitNet chat session
+make test       # Build and start the interactive chat session
 make shell      # Open a shell inside the image
 make push       # Push the image to Docker Hub
 make pull       # Pull the image from Docker Hub

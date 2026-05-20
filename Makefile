@@ -19,7 +19,7 @@ build:
 	$(DOCKER) build -t $(FULL_IMAGE) .
 
 run:
-	$(DOCKER) run --rm $(FULL_IMAGE)
+	$(DOCKER) run --rm -it $(FULL_IMAGE)
 
 test: build run
 

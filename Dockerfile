@@ -59,4 +59,4 @@ RUN ls /root/.local/bin && /root/.local/bin/hf download microsoft/BitNet-b1.58-2
 
 RUN conda run -n bitnet-cpp python setup_env.py -md models/BitNet-b1.58-2B-4T -q i2_s || (cat logs/compile.log && false)
 
-CMD ["conda", "run", "--no-capture-output", "-n", "bitnet-cpp", "python", "run_inference.py", "-m", "models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf", "-p", "Say hello from BitNet in one short sentence."]
+CMD ["conda", "run", "--no-capture-output", "-n", "bitnet-cpp", "python", "run_inference.py", "-m", "models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf", "-p", "You are a helpful assistant", "-cnv"]
