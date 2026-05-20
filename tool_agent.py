@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 import os
-import json
+import pty
 import re
+import select
 import shlex
 import signal
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
@@ -22,16 +21,80 @@ MAX_COMMAND_OUTPUT = 20000
 COMMAND_TIMEOUT_SECONDS = 30
 LLM_START_TIMEOUT_SECONDS = 180
 LLM_RESPONSE_TIMEOUT_SECONDS = 240
-LLM_HOST = os.environ.get("LLM_HOST", "127.0.0.1")
-LLM_PORT = int(os.environ.get("LLM_PORT", "18080"))
-LLM_URL = f"http://{LLM_HOST}:{LLM_PORT}"
-LLM_LOG_PATH = Path(os.environ.get("LLM_LOG_PATH", "/tmp/bitnet-llm-server.log"))
+LLM_IDLE_SECONDS = float(os.environ.get("LLM_IDLE_SECONDS", "1.5"))
+MAX_REFERENCE_GAME_BYTES = 2500
+MAX_REFERENCE_GAMES = 2
+
 SYSTEM_PROMPT = """You are BitNet running inside a Dockerized POSIX shell training image.
 Answer normal user requests directly.
 When asked to create shell programs, prefer strictly POSIX sh and terminal-size-aware code.
 The wrapper around you can execute local tools such as ls, cat, find, and shell commands.
 If a user asks for filesystem inspection or command execution, keep your answer brief because the wrapper will run the tool.
 """
+
+# Deterministic mapping from analysis finding labels to skill snippets.
+# Only entries whose text is not already present in POSIX.md are auto-added.
+FINDING_SKILL_HINTS = {
+    "function keyword": (
+        "### Function syntax\n"
+        "- `function name() {}` is Bash only. Use `name() { ... }` in POSIX sh.\n"
+    ),
+    "local keyword": (
+        "### No local variables\n"
+        "- `local var=value` is not POSIX sh. Use distinct global names or `unset` after use.\n"
+    ),
+    "process substitution": (
+        "### Process substitution\n"
+        "- `<(...)` is Bash only. Use a temp file or pipeline instead.\n"
+    ),
+    "brace expansion": (
+        "### Brace expansion\n"
+        "- `{1..10}` is Bash only. Use `seq 1 10` or a `while` counter.\n"
+    ),
+    "posix syntax check failed": (
+        "### Syntax errors\n"
+        "- Verify scripts with `sh -n` before shipping.\n"
+        "- Common causes: unclosed quotes, missing `fi`/`done`/`esac`, stray Bash syntax.\n"
+    ),
+    "bash shebang": (
+        "### Shebang\n"
+        "- Always use `#!/bin/sh`. Never use `#!/bin/bash` in a POSIX sh game.\n"
+    ),
+    "bash random": (
+        "### Random numbers\n"
+        "- `$RANDOM` is Bash only.\n"
+        "- Use `awk -v max=\"$n\" 'BEGIN{srand(); print int(rand()*max)+1}'`.\n"
+    ),
+    "read -n/-t": (
+        "### Non-blocking input\n"
+        "- `read -n` and `read -t` are Bash only.\n"
+        "- Use `stty raw min 0 time 1` then `key=$(dd bs=1 count=1 2>/dev/null)`.\n"
+    ),
+    "bash arrays": (
+        "### No arrays\n"
+        "- Arrays `arr=(...)` are Bash only.\n"
+        "- Store lists as space-separated `x,y` records in a plain variable.\n"
+    ),
+    "double-bracket test": (
+        "### Conditional test\n"
+        "- `[[ ... ]]` is Bash only. Use `[ ... ]` or `case` for conditions.\n"
+    ),
+}
+
+_GAME_PROMPT_PREFIX = """\
+Create one complete terminal game in strictly POSIX sh.
+Mandatory rules:
+- Shebang: #!/bin/sh
+- No Bash: no arrays arr=(), no [[ ]], no read -n, no read -t, \
+no $RANDOM, no function keyword, no local, no <(...), no {1..N}
+- Terminal size: read with tput cols/lines, clamp, never hardcode
+- Setup: oldstty=$(stty -g); trap 'stty "$oldstty"; tput cnorm; clear; exit' INT TERM HUP EXIT; \
+stty -echo raw min 0 time 1; tput civis
+- Input: key=$(dd bs=1 count=1 2>/dev/null)
+- Lists: space-separated x,y records, not arrays
+- Random: awk -v max="$n" 'BEGIN{srand(); print int(rand()*max)+1}'
+Only output the shell script in one ```sh code block.
+Game request: """
 
 
 def resolve_path(raw_path):
@@ -136,76 +199,219 @@ def read_posix_skill():
     return skill_path.read_text(encoding="utf-8", errors="replace")[:8000]
 
 
+def load_reference_games():
+    games_dir = KNOWLEDGE_DIR / "games"
+    if not games_dir.exists():
+        return ""
+    chunks = []
+    for game_file in sorted(games_dir.glob("*.sh"))[:MAX_REFERENCE_GAMES]:
+        content = game_file.read_text(encoding="utf-8", errors="replace")[:MAX_REFERENCE_GAME_BYTES]
+        chunks.append(f"Reference game ({game_file.name}):\n```sh\n{content}\n```")
+    if not chunks:
+        return ""
+    return "\nWorking reference games (use as style guidance):\n" + "\n\n".join(chunks)
+
+
 def build_system_prompt():
     skill = read_posix_skill()
-    if not skill:
-        return SYSTEM_PROMPT
-    return f"{SYSTEM_PROMPT}\nCompact POSIX shell knowledge loaded once at startup:\n{skill}"
+    reference = load_reference_games()
+    parts = [SYSTEM_PROMPT]
+    if skill:
+        parts.append(f"Compact POSIX shell knowledge loaded once at startup:\n{skill}")
+    if reference:
+        parts.append(reference)
+    return "\n".join(parts)
+
+
+def add_skill_entry(text):
+    skill_path = KNOWLEDGE_DIR / "skills" / "POSIX.md"
+    existing = skill_path.read_text(encoding="utf-8", errors="replace") if skill_path.exists() else ""
+    normalized = text.strip()
+    if normalized in existing:
+        return f"skill already present in {skill_path}"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(skill_path, "a", encoding="utf-8") as f:
+        f.write(f"\n{normalized}\n")
+    return f"skill added to {skill_path}"
+
+
+def suggest_new_skills(findings):
+    """Return (key, hint) pairs for findings not yet covered by POSIX.md."""
+    skill_path = KNOWLEDGE_DIR / "skills" / "POSIX.md"
+    existing = skill_path.read_text(encoding="utf-8", errors="replace") if skill_path.exists() else ""
+    new_skills = []
+    seen_keys = set()
+    for finding in findings:
+        label = finding.lstrip("- ").split(":")[0].strip().lower()
+        for key, hint in FINDING_SKILL_HINTS.items():
+            if key in label and key not in seen_keys and hint.strip() not in existing:
+                new_skills.append((key, hint))
+                seen_keys.add(key)
+                break
+    return new_skills
 
 
 class BitNetService:
     def __init__(self):
         self.process = None
-        self.log_file = None
+        self.master_fd = None
 
     def start(self):
         if self.process and self.process.poll() is None:
             return
 
-        print("[llm] starting persistent BitNet server...", flush=True)
-        try:
-            LLM_LOG_PATH.unlink()
-        except FileNotFoundError:
-            pass
-        self.log_file = LLM_LOG_PATH.open("ab")
+        print("[llm] starting persistent run_inference.py process...", flush=True)
+        master_fd, slave_fd = pty.openpty()
         command = [
-            "build/bin/llama-server",
+            "python",
+            "run_inference.py",
             "-m",
             MODEL_PATH,
-            "-c",
-            "2048",
-            "-t",
-            "2",
             "-n",
             N_PREDICT,
-            "-ngl",
-            "0",
-            "--temp",
-            "0.8",
-            "--host",
-            LLM_HOST,
-            "--port",
-            str(LLM_PORT),
-            "-cb",
             "-p",
             build_system_prompt(),
+            "-cnv",
         ]
         self.process = subprocess.Popen(
             command,
             cwd=BITNET_DIR,
-            stdin=subprocess.DEVNULL,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
             close_fds=True,
             start_new_session=True,
         )
-        self._wait_for_health()
+        os.close(slave_fd)
+        self.master_fd = master_fd
+        os.set_blocking(self.master_fd, False)
+        self._wait_for_interactive_prompt()
         self._poke()
-        print("[llm] ready after health check and internal poke", flush=True)
+        print("[llm] ready after run_inference.py startup poke", flush=True)
 
-    def ask(self, prompt):
-        self.start()
-        return self._completion(
-            {
-                "prompt": prompt,
-                "n_predict": int(N_PREDICT),
-                "temperature": 0.8,
-                "stream": False,
-            },
-            timeout=LLM_RESPONSE_TIMEOUT_SECONDS,
+    def ask(self, prompt, ensure_started=True, stream=False):
+        if ensure_started:
+            self.start()
+        os.write(self.master_fd, f"{prompt.rstrip()}\n".encode("utf-8"))
+        raw = self._read_until_idle(LLM_RESPONSE_TIMEOUT_SECONDS, stream=stream)
+        return self._clean_response(raw, prompt)
+
+    def _poke(self):
+        content = self.ask("Reply with exactly READY.", ensure_started=False)
+        if not content.strip():
+            raise RuntimeError("BitNet run_inference.py returned an empty startup poke")
+
+    def _wait_for_interactive_prompt(self):
+        output = self._read_until_prompt(LLM_START_TIMEOUT_SECONDS)
+        if not output:
+            raise RuntimeError("BitNet run_inference.py did not produce startup output")
+
+    def _read_until_prompt(self, timeout):
+        deadline = time.monotonic() + timeout
+        chunks = []
+        while time.monotonic() < deadline:
+            self._raise_if_exited(chunks)
+            data = self._read_available(0.2)
+            if not data:
+                continue
+            chunks.append(data)
+            text = self._normalize("".join(chunks))
+            if text.endswith("\n> ") or re.search(r"(?m)^> $", text):
+                return text
+        raise RuntimeError("Timed out waiting for run_inference.py interactive prompt")
+
+    def _read_until_idle(self, timeout, stream=False):
+        deadline = time.monotonic() + timeout
+        idle_deadline = None
+        chunks = []
+        stream_buf = ""
+        _noisy = (
+            "warning:", "build:", "main:", "llama_", "llm_", "common_",
+            "sampler ", "generate:", "system_info:", "== Running in interactive mode.",
+            " - Press ", "System:",
         )
+        while time.monotonic() < deadline:
+            self._raise_if_exited(chunks)
+            data = self._read_available(0.2)
+            if data:
+                chunks.append(data)
+                idle_deadline = time.monotonic() + LLM_IDLE_SECONDS
+                if stream:
+                    clean = self._normalize(data)
+                    clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", clean)
+                    stream_buf += clean
+                    while "\n" in stream_buf:
+                        line, stream_buf = stream_buf.split("\n", 1)
+                        s = line.strip()
+                        if not s or s in (">", "> "):
+                            continue
+                        if any(s.startswith(p) for p in _noisy):
+                            continue
+                        sys.stdout.write(line + "\n")
+                        sys.stdout.flush()
+                continue
+            if idle_deadline and time.monotonic() >= idle_deadline:
+                if stream and stream_buf.strip():
+                    s = stream_buf.strip()
+                    if s not in (">", "> ") and not any(s.startswith(p) for p in _noisy):
+                        sys.stdout.write(s + "\n")
+                        sys.stdout.flush()
+                return "".join(chunks)
+        return "".join(chunks)
+
+    def _read_available(self, timeout):
+        readable, _, _ = select.select([self.master_fd], [], [], timeout)
+        if not readable:
+            return ""
+        try:
+            data = os.read(self.master_fd, 4096)
+        except BlockingIOError:
+            return ""
+        if not data:
+            return ""
+        return data.decode("utf-8", errors="replace")
+
+    def _raise_if_exited(self, chunks):
+        if self.process and self.process.poll() is not None:
+            output = self._normalize("".join(chunks))
+            raise RuntimeError(f"BitNet run_inference.py exited with code {self.process.returncode}.\n{output}")
+
+    def _clean_response(self, raw, prompt):
+        text = self._normalize(raw)
+        text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+        text = re.sub(r"(?m)^>\s?", "", text)
+        text = text.replace(prompt, "", 1).strip()
+        noisy_prefixes = (
+            "warning:",
+            "build:",
+            "main:",
+            "llama_",
+            "llm_",
+            "common_",
+            "sampler ",
+            "generate:",
+            "system_info:",
+            "== Running in interactive mode.",
+            " - Press ",
+            "System:",
+        )
+        lines = [line for line in text.splitlines() if not line.strip().startswith(noisy_prefixes)]
+        return "\n".join(lines).strip()
+
+    def _normalize(self, text):
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def restart(self):
+        self.close()
+        self.start()
 
     def close(self):
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
         if self.process and self.process.poll() is None:
             try:
                 os.killpg(self.process.pid, signal.SIGTERM)
@@ -216,71 +422,6 @@ class BitNetService:
                 except OSError:
                     pass
         self.process = None
-        if self.log_file:
-            try:
-                self.log_file.close()
-            except OSError:
-                pass
-            self.log_file = None
-
-    def _wait_for_health(self):
-        deadline = time.monotonic() + LLM_START_TIMEOUT_SECONDS
-        last_error = ""
-
-        while time.monotonic() < deadline:
-            if self.process and self.process.poll() is not None:
-                raise RuntimeError(self._startup_failure("BitNet server exited during startup"))
-
-            try:
-                with urllib.request.urlopen(f"{LLM_URL}/health", timeout=2) as response:
-                    if response.status == 200:
-                        return
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-                last_error = str(exc)
-            time.sleep(1)
-
-        raise RuntimeError(self._startup_failure(f"BitNet server health check timed out: {last_error}"))
-
-    def _poke(self):
-        content = self._completion(
-            {
-                "prompt": "Internal startup check. Reply with READY.",
-                "n_predict": 8,
-                "temperature": 0.1,
-                "stream": False,
-            },
-            timeout=60,
-        )
-        if not content.strip():
-            raise RuntimeError(self._startup_failure("BitNet server returned an empty startup poke"))
-
-    def _completion(self, payload, timeout):
-        data = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            f"{LLM_URL}/completion",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-            raise RuntimeError(f"BitNet server request failed: {exc}") from exc
-
-        parsed = json.loads(body)
-        return str(parsed.get("content", "")).strip()
-
-    def _startup_failure(self, message):
-        log_tail = ""
-        try:
-            if LLM_LOG_PATH.exists():
-                log_tail = LLM_LOG_PATH.read_text(encoding="utf-8", errors="replace")[-4000:]
-        except OSError:
-            pass
-        if log_tail:
-            return f"{message}.\nLast server log lines:\n{log_tail}"
-        return message
 
 
 def slugify_name(name):
@@ -315,6 +456,7 @@ def extract_shell_script(raw_text):
 
 
 def analyze_shell_script(script_path, raw_path):
+    """Return (findings_list, report_text)."""
     script = script_path.read_text(encoding="utf-8", errors="replace")
     findings = []
 
@@ -363,7 +505,7 @@ def analyze_shell_script(script_path, raw_path):
         "- Use `case` instead of `[[ ... ]]`.",
         "- Use `stty raw min 0 time 1` plus `dd bs=1 count=1` for non-blocking input.",
     ]
-    return "\n".join(report) + "\n"
+    return findings, "\n".join(report) + "\n"
 
 
 def generate_game(request, llm_service):
@@ -376,10 +518,9 @@ def generate_game(request, llm_service):
     generated_dir.mkdir(parents=True, exist_ok=True)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    prompt = f"""Create one complete terminal game in strictly POSIX sh.
-Only output the shell script in one ```sh code block.
-Game request: {description}
-"""
+    prompt = _GAME_PROMPT_PREFIX + description + "\n"
+
+    print("[game] generating first pass...", flush=True)
     raw = llm_service.ask(prompt)
     raw_path = generated_dir / f"{name}.raw.txt"
     script_path = generated_dir / f"{name}.sh"
@@ -389,18 +530,90 @@ Game request: {description}
     script = extract_shell_script(raw)
     script_path.write_text(script, encoding="utf-8")
     script_path.chmod(0o755)
-    report_path.write_text(analyze_shell_script(script_path, raw_path), encoding="utf-8")
 
-    return "\n".join(
-        [
-            f"Generated game request: {description}",
-            f"script: {script_path}",
-            f"raw capture: {raw_path}",
-            f"analysis: {report_path}",
-            "",
-            report_path.read_text(encoding="utf-8", errors="replace"),
-        ]
-    )
+    findings, report_text = analyze_shell_script(script_path, raw_path)
+
+    # Self-correction pass when portability issues remain
+    if findings:
+        findings_summary = "\n".join(findings)
+        fix_prompt = (
+            f"This POSIX sh game script has portability issues:\n{findings_summary}\n\n"
+            f"Fix all issues. Output only the corrected script in one ```sh code block.\n"
+            f"Script:\n```sh\n{script[:4000]}\n```\n"
+        )
+        print(f"[game] {len(findings)} issue(s) found, running correction pass...", flush=True)
+        raw2 = llm_service.ask(fix_prompt)
+        script2 = extract_shell_script(raw2)
+        if script2 and script2.strip() != script.strip():
+            script_path.write_text(script2, encoding="utf-8")
+            script_path.chmod(0o755)
+            findings, report_text = analyze_shell_script(script_path, raw_path)
+            print("[game] correction pass complete", flush=True)
+
+    report_path.write_text(report_text, encoding="utf-8")
+
+    # Auto-add skill snippets for findings not already in POSIX.md, then reload service
+    new_skills = suggest_new_skills(findings)
+    skill_msgs = []
+    for _key, hint in new_skills:
+        msg = add_skill_entry(hint)
+        skill_msgs.append(msg)
+
+    if skill_msgs:
+        print(f"[skill] {len(skill_msgs)} new skill(s) added — reloading BitNet service...", flush=True)
+        llm_service.restart()
+        print("[skill] service reloaded with updated knowledge", flush=True)
+
+    output_parts = [
+        f"Generated game request: {description}",
+        f"script: {script_path}",
+        f"raw capture: {raw_path}",
+        f"analysis: {report_path}",
+        "",
+        report_text,
+    ]
+    if skill_msgs:
+        output_parts.append("Skills auto-added and service reloaded:")
+        output_parts.extend(f"  {m}" for m in skill_msgs)
+
+    return "\n".join(output_parts)
+
+
+def learn_from_report(game_name, llm_service):
+    reports_dir = KNOWLEDGE_DIR / "reports"
+    if game_name:
+        slug = slugify_name(game_name)
+        report_path = reports_dir / f"{slug}.md"
+    else:
+        reports = sorted(reports_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True) if reports_dir.exists() else []
+        if not reports:
+            return "No reports found in knowledge/reports/."
+        report_path = reports[0]
+
+    if not report_path.exists():
+        return f"Report not found: {report_path}"
+
+    report_text = report_path.read_text(encoding="utf-8", errors="replace")
+    findings = re.findall(r"^- .+$", report_text, flags=re.MULTILINE)
+    blockers = [f for f in findings if "found" in f or "failed" in f]
+
+    if not blockers:
+        return f"No portability issues in {report_path.name}. Nothing to learn."
+
+    new_skills = suggest_new_skills(blockers)
+    if not new_skills:
+        return f"All issues from {report_path.name} are already covered in POSIX.md."
+
+    skill_msgs = []
+    for _key, hint in new_skills:
+        msg = add_skill_entry(hint)
+        skill_msgs.append(f"{hint.strip()}\n  → {msg}")
+
+    if any("added" in m for m in skill_msgs):
+        llm_service.restart()
+        skill_msgs.append("Service reloaded with updated knowledge.")
+
+    return f"Learned from {report_path.name}:\n\n" + "\n\n".join(skill_msgs)
 
 
 def extract_path_after(text, markers, default="."):
@@ -426,6 +639,25 @@ def handle_tool_request(user_text, llm_service):
     for marker in ("crea un gioco ", "create a game ", "generate a game "):
         if lowered.startswith(marker):
             return "game", generate_game(user_text[len(marker):], llm_service)
+
+    if lowered.startswith("/skill "):
+        text = user_text[7:].strip()
+        if not text:
+            return "skill", "Usage: /skill <text to add to POSIX.md>"
+        msg = add_skill_entry(text)
+        if "added" in msg:
+            llm_service.restart()
+            msg += "\nService reloaded with updated knowledge."
+        return "skill", msg
+
+    if lowered.startswith("/learn"):
+        parts = user_text.split(maxsplit=1)
+        game_name = parts[1].strip() if len(parts) > 1 else None
+        return "learn", learn_from_report(game_name, llm_service)
+
+    if lowered in {"/restart", "restart agent", "riavvia agente"}:
+        llm_service.restart()
+        return "restart", "BitNet service restarted with current knowledge."
 
     if lowered.startswith("/sh ") or lowered.startswith("!"):
         command = user_text[4:] if lowered.startswith("/sh ") else user_text[1:]
@@ -461,14 +693,18 @@ def handle_tool_request(user_text, llm_service):
 
 def print_help():
     print("BitNet tool agent")
-    print("BitNet runs as a health-checked persistent background service.")
+    print("BitNet runs as a persistent spawned run_inference.py process.")
     print("Ask normally, or use local tools:")
     print("  /ls [path]       list files")
     print("  /cat <path>      read a text file")
     print("  /find <name>     find files by name")
     print("  /sh <command>    run a shell command inside the container")
     print("  !<command>       shortcut for /sh")
-    print("  /game <name>     generate, save, and analyze a POSIX sh game")
+    print("  /game <name> [description]")
+    print("                   generate, save, analyze, and auto-improve a POSIX sh game")
+    print("  /skill <text>    append a skill entry to knowledge/skills/POSIX.md and reload")
+    print("  /learn [game]    extract skill lessons from a report and reload")
+    print("  /restart         reload BitNet service with current knowledge")
     print("  pwd              show current directory")
     print("  /exit            quit")
 
@@ -500,8 +736,9 @@ def main():
                 print(tool_result)
                 continue
 
-            print("\nBitNet>")
-            print(llm_service.ask(user_text))
+            sys.stdout.write("\nBitNet>\n")
+            sys.stdout.flush()
+            llm_service.ask(user_text, stream=True)
     finally:
         llm_service.close()
 

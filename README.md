@@ -93,14 +93,14 @@ The default Docker command also starts the tool agent:
 docker run --rm -it yafb/bitnet:latest
 ```
 
-The tool agent starts an internal persistent BitNet server before exposing the
-`You>` prompt. Startup waits for the server `/health` endpoint and then sends a
-small internal poke request. If either check fails, the agent exits instead of
-opening a broken interactive session.
+The tool agent starts a persistent spawned `python run_inference.py` process
+before exposing the `You>` prompt. Startup waits for the interactive BitNet
+prompt and then sends a small internal poke request. If either check fails, the
+agent exits instead of opening a broken interactive session.
 
 After startup, use `/exit` or `Ctrl+C` to leave the session. The wrapper keeps
-the background BitNet process alive and sends prompts to that service instead of
-launching a new inference process each time.
+the background `run_inference.py` process alive and sends prompts to that
+process instead of launching a new inference process each time.
 
 At service startup, the wrapper loads compact knowledge from `knowledge/skills/`
 once into the initial system prompt. Later game or artifact requests reuse that
@@ -150,18 +150,24 @@ knowledge/reports/
 ## Synthetic Skill Training Loop
 
 This repository uses a lightweight training process based on artifacts, not
-weight updates. The loop is:
+weight updates. The automated loop is:
 
-1. Give BitNet a concrete creation task, usually a POSIX shell game or terminal
-   artifact.
-2. Save the raw model output under `knowledge/generated/`.
-3. Extract the runnable shell script and check it with `sh -n`.
-4. Inspect the result manually or through reports under `knowledge/reports/`.
-5. Identify the smallest missing concept that caused the failure.
-6. Add a short, reusable snippet to `knowledge/skills/POSIX.md`.
-7. Start a new agent session so the persistent BitNet service loads the updated
-   skill once at startup.
-8. Regenerate the artifact and compare the behavior.
+1. Give BitNet a concrete creation task with `/game <name> [description]`.
+2. The agent saves the raw model output under `knowledge/generated/`.
+3. It extracts the runnable shell script and checks it with `sh -n`.
+4. If portability issues are found, it runs a **self-correction pass**: the
+   script and its findings are sent back to BitNet, which produces a revised
+   version that is re-analyzed.
+5. The agent maps each remaining finding to a compact skill snippet and appends
+   any new entries to `knowledge/skills/POSIX.md`.
+6. The BitNet service is restarted in-session so the new skill is active
+   immediately for the next generation — no Docker restart needed.
+7. Use `/learn [game]` to replay this extraction on any saved report.
+8. Use `/skill <text>` to append a skill entry manually and reload.
+
+The system also loads working reference games from `knowledge/games/` into the
+initial system prompt so BitNet can observe concrete correct examples alongside
+the rule snippets.
 
 The skill file should stay synthetic and compact. It is not a long tutorial and
 it should not contain large copied programs. Each snippet should encode one
@@ -204,15 +210,18 @@ From inside the container, BitNet is available in `/app/BitNet`.
 The wrapper supports a small allowlist of local tools:
 
 ```sh
-/ls [path]       # list files
-/cat <path>      # read a text file, truncated for safety
-/find <name>     # find files by name
-/sh <command>    # run a shell command inside the container
-!<command>       # shortcut for /sh
-/game <name>     # generate, save, and analyze a POSIX sh game
-pwd              # show the current directory
-/help            # show commands
-/exit            # quit
+/ls [path]                    # list files
+/cat <path>                   # read a text file, truncated for safety
+/find <name>                  # find files by name
+/sh <command>                 # run a shell command inside the container
+!<command>                    # shortcut for /sh
+/game <name> [description]    # generate, correct, analyze, and improve a POSIX sh game
+/skill <text>                 # append a skill entry to POSIX.md and reload service
+/learn [game]                 # extract skill lessons from a saved report and reload
+/restart                      # reload the BitNet service with current knowledge
+pwd                           # show the current directory
+/help                         # show commands
+/exit                         # quit
 ```
 
 Natural-language requests such as `dammi la lista dei file nel disco` are routed
